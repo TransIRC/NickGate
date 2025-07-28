@@ -11,8 +11,10 @@ import (
         "os/signal"
         "path/filepath"
         "strings"
+        "sync"
         "syscall"
         "time"
+        "fmt"
         "unsafe"
 
         "nickgate/config"
@@ -29,15 +31,18 @@ var (
 )
 
 type Server struct {
-        config               *ssh.ServerConfig
-        nsAuth               *nickserv.AuthClient
-        sshPort              string
-        hostKeyFile          string
-        forceCmd             string
-        forceOnExitCommand   string
-        realIPFallback       string
-        proxyProtocolEnabled bool
-        proxyAllowedIPs      []net.IPNet
+        config                  *ssh.ServerConfig
+        nsAuth                  *nickserv.AuthClient
+        sshPort                 string
+        hostKeyFile             string
+        forceCmd                string
+        forceOnExitCommand      string
+        realIPFallback          string
+        proxyProtocolEnabled    bool
+        proxyAllowedIPs         []net.IPNet
+        allowRegistrationOnFail bool           // Store config setting
+        loginFailures           map[string]int // Track failures per session
+        failuresLock            sync.Mutex     // Mutex for the failure map
 }
 
 func initLogging(logPath string) error {
@@ -57,21 +62,24 @@ func NewServer(cfg *config.Config) (*Server, error) {
         }
 
         server := &Server{
-                sshPort:              cfg.SSHPort,
-                hostKeyFile:          cfg.HostKeyFile,
-                forceCmd:             cfg.ForceCommand,
-                forceOnExitCommand:   cfg.ForceOnExitCommand,
-                realIPFallback:       cfg.RealIPFallback,
-                proxyProtocolEnabled: cfg.ProxyProtocolEnabled,
-                proxyAllowedIPs:      cfg.ProxyAllowedIPs,
+                sshPort:                 cfg.SSHPort,
+                hostKeyFile:             cfg.HostKeyFile,
+                forceCmd:                cfg.ForceCommand,
+                forceOnExitCommand:      cfg.ForceOnExitCommand,
+                realIPFallback:          cfg.RealIPFallback,
+                proxyProtocolEnabled:    cfg.ProxyProtocolEnabled,
+                proxyAllowedIPs:         cfg.ProxyAllowedIPs,
+                allowRegistrationOnFail: cfg.NickServAPI.AllowRegistrationOnFail, // Initialize from config
+                loginFailures:           make(map[string]int),                  // Initialize map
                 nsAuth: nickserv.NewAuthClient(
                         cfg.NickServAPI.URL,
+                        cfg.NickServAPI.RegisterURL, // <-- Pass register URL here!
                         cfg.NickServAPI.Token,
                 ),
         }
 
         sshConfig := &ssh.ServerConfig{
-                PasswordCallback: server.passwordCallback,
+                PasswordCallback: server.authCallback, // Use our new stateful callback
         }
 
         hostKeyBytes, err := os.ReadFile(server.hostKeyFile)
@@ -91,22 +99,66 @@ func NewServer(cfg *config.Config) (*Server, error) {
 
 }
 
-func (s *Server) passwordCallback(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
-        ok, err := s.nsAuth.Authenticate(conn.User(), string(password))
+// Renamed and updated the original passwordCallback to handle the new logic
+func (s *Server) authCallback(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+        user := conn.User()
+        sessionID := string(conn.SessionID())
+
+        // Try to authenticate normally first.
+        ok, err := s.nsAuth.Authenticate(user, string(password))
         if err != nil {
-                logger.Printf("NickServ auth error for %s: %v", conn.User(), err)
-                return nil, err
+                logger.Printf("NickServ auth API error for %s: %v", user, err)
+                // Don't leak internal errors to the client, just fail the auth.
         }
-        if !ok {
-                return nil, ssh.ErrNoAuth
+
+        if ok {
+                // On success, clear failure count and grant access.
+                s.failuresLock.Lock()
+                delete(s.loginFailures, sessionID)
+                s.failuresLock.Unlock()
+                logger.Printf("Authentication successful for user %s", user)
+                return &ssh.Permissions{
+                        Extensions: map[string]string{
+                                "user":        user,
+                                "remote-addr": conn.RemoteAddr().String(),
+                                "password":    string(password),
+                        },
+                }, nil
         }
-        return &ssh.Permissions{
-                Extensions: map[string]string{
-                        "user":        conn.User(),
-                        "remote-addr": conn.RemoteAddr().String(),
-                        "password":    string(password),
-                },
-        }, nil
+
+        // Auth failed. Lock, increment, and check failure count.
+        s.failuresLock.Lock()
+        s.loginFailures[sessionID]++
+        failures := s.loginFailures[sessionID]
+        s.failuresLock.Unlock()
+
+        logger.Printf("Authentication failed for user %s. Attempt %d.", user, failures)
+
+        // After 2 failed attempts (on the 3rd+), try to register if enabled.
+        if s.allowRegistrationOnFail && failures > 2 {
+                logger.Printf("Attempting registration for %s after %d failed logins.", user, failures-1)
+
+                regOk, regErr := s.nsAuth.Register(user, string(password))
+                if regOk {
+                        logger.Printf("Registration successful for new user %s", user)
+                        // On successful registration, reset counter and grant access.
+                        s.failuresLock.Lock()
+                        delete(s.loginFailures, sessionID)
+                        s.failuresLock.Unlock()
+                        return &ssh.Permissions{
+                                Extensions: map[string]string{
+                                        "user":        user,
+                                        "remote-addr": conn.RemoteAddr().String(),
+                                        "password":    string(password),
+                                },
+                        }, nil
+                }
+                if regErr != nil {
+                        logger.Printf("Registration failed for user %s: %v", user, regErr)
+                }
+        }
+        // Return a generic error to prompt the user to try again.
+        return nil, fmt.Errorf("permission denied")
 }
 
 func (s *Server) handleConnection(conn net.Conn) {
@@ -159,6 +211,15 @@ func (s *Server) handleConnection(conn net.Conn) {
         }
         defer sshConn.Close()
 
+        // Defer cleanup of the session from the failure map.
+        defer func() {
+                sessionID := string(sshConn.SessionID())
+                s.failuresLock.Lock()
+                delete(s.loginFailures, sessionID)
+                s.failuresLock.Unlock()
+                logger.Printf("Cleaned up session data for %s", sessionID)
+        }()
+
         sshConn.Permissions.Extensions["real-ip"] = realIP
 
         logger.Printf("SSH connection established: user=%s client=%s real_ip=%s version=%s duration=%s",
@@ -179,6 +240,9 @@ func (s *Server) handleConnection(conn net.Conn) {
         }
 
 }
+
+// The rest of the file (isProxyAllowed, handleSession, etc.) remains unchanged.
+// ...
 
 func (s *Server) isProxyAllowed(addr net.Addr) bool {
         if len(s.proxyAllowedIPs) == 0 {

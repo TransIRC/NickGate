@@ -16,8 +16,10 @@ type Config struct {
         ProxyProtocolEnabled bool
         ProxyAllowedIPs      []net.IPNet
         NickServAPI          struct {
-                URL   string
-                Token string
+                URL                     string
+                RegisterURL             string // New field for registration endpoint
+                Token                   string
+                AllowRegistrationOnFail bool // New field for the toggle
         }
 }
 
@@ -65,7 +67,10 @@ func Load(path string) (*Config, error) {
 
         nickservSection := cfgFile.Section("nickserv")
         cfg.NickServAPI.URL = nickservSection.Key("api_url").String()
+        cfg.NickServAPI.RegisterURL = nickservSection.Key("register_api_url").String()
         cfg.NickServAPI.Token = nickservSection.Key("api_token").String()
+        // Load the new setting from the [nickserv] section
+        cfg.NickServAPI.AllowRegistrationOnFail = nickservSection.Key("allow_registration_on_fail").MustBool(false)
 
         return cfg, nil
 }
